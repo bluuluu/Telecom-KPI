@@ -1,0 +1,86 @@
+# Azure Pipeline to refresh the Power BI dataset on schedule.
+# Replace variable values in the UI or variable group; do not hardcode secrets.
+
+trigger:
+  branches:
+    include:
+      - main
+
+schedules:
+  - cron: "0 5 * * *"   # 05:00 UTC daily
+    displayName: Daily refresh
+    always: true
+    branches:
+      include:
+        - main
+
+variables:
+  - name: POWERBI_TENANT_ID
+    value: "$(powerbi-tenant-id)"
+  - name: POWERBI_WORKSPACE_ID
+    value: "$(powerbi-workspace-id)"
+  - name: POWERBI_DATASET_ID
+    value: "$(powerbi-dataset-id)"
+  - name: POWERBI_CLIENT_ID
+    value: "$(powerbi-client-id)"
+  - name: POWERBI_CLIENT_SECRET
+    value: "$(powerbi-client-secret)"
+
+stages:
+  - stage: refresh_dataset
+    displayName: Refresh Power BI Dataset
+    jobs:
+      - job: refresh
+        displayName: Trigger dataset refresh
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          - task: PowerShell@2
+            displayName: Trigger and poll Power BI refresh
+            inputs:
+              targetType: inline
+              script: |
+                $tenantId = "$(POWERBI_TENANT_ID)"
+                $workspaceId = "$(POWERBI_WORKSPACE_ID)"
+                $datasetId = "$(POWERBI_DATASET_ID)"
+                $clientId = "$(POWERBI_CLIENT_ID)"
+                $clientSecret = "$(POWERBI_CLIENT_SECRET)"
+
+                if (-not $tenantId -or -not $workspaceId -or -not $datasetId) {
+                  Write-Error "Missing required Power BI IDs."
+                  exit 1
+                }
+
+                $body = @{
+                  grant_type    = "client_credentials"
+                  client_id     = $clientId
+                  client_secret = $clientSecret
+                  scope         = "https://analysis.windows.net/powerbi/api/.default"
+                }
+
+                $tokenResponse = Invoke-RestMethod -Method Post -Uri "https://login.microsoftonline.com/$tenantId/oauth2/v2.0/token" -Body $body
+                $accessToken = $tokenResponse.access_token
+
+                $headers = @{ Authorization = "Bearer $accessToken" }
+
+                $refreshUrl = "https://api.powerbi.com/v1.0/myorg/groups/$workspaceId/datasets/$datasetId/refreshes"
+                $refresh = Invoke-RestMethod -Method Post -Uri $refreshUrl -Headers $headers -Body (@{ notifyOption = "MailOnFailure" } | ConvertTo-Json) -ContentType "application/json"
+
+                $refreshId = $refresh.id
+                Write-Host "Triggered refresh: $refreshId"
+
+                $attempt = 0
+                do {
+                  Start-Sleep -Seconds 30
+                  $attempt++
+                  $statusResponse = Invoke-RestMethod -Method Get -Uri "$refreshUrl/$refreshId" -Headers $headers
+                  $status = $statusResponse.status
+                  Write-Host "Attempt $attempt: status = $status"
+                } while ($status -eq "Unknown" -or $status -eq "InProgress")
+
+                if ($status -ne "Completed") {
+                  Write-Error "Dataset refresh failed with status $status"
+                  exit 1
+                }
+
+                Write-Host "Dataset refresh completed."
